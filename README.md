@@ -1,0 +1,1 @@
+# SOPy: Structural Standard Operation Procedure (SOP) Prompting framework
