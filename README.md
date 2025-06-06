@@ -1,1 +1,1 @@
-# SOPy: Structural Standard Operation Procedure (SOP) Prompting framework
+# S<sup>2</sup>OPy: Structural Standard Operation Procedure (SOP) Prompting framework
