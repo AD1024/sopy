@@ -1,3 +1,6 @@
+from typing import Optional
+
+
 class Prompt:
     """
     A class to represent a prompt for the LLM.
@@ -20,6 +23,9 @@ class Prompt:
             str: The prompt string.
         """
         return self.prompt
+
+def cond(value: bool, descripton: Optional[str] = None) -> bool:
+    return value
 
 
 # TODO: convertion to Strands prompt / LangChain prompt, etc.
