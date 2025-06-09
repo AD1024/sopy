@@ -153,7 +153,7 @@ class Abort(Procedure[FSInfo]):
             return f"File {dst} is not from the backup or migration path. Cannot delete."
         
         if cond(self.deleted_backup == sigma.path_backuped and self.deleted_migration == sigma.path_copied,
-                "Backups and partially migrated files deleted."):
+                "Backups and partially migrated files are deleted."):
             return End()
         return self
 

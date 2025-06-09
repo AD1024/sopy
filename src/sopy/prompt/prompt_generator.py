@@ -1,13 +1,16 @@
 import ast
 import inspect
 import textwrap
-from typing import Dict, List, Set, Optional, Type, Tuple
+import types
+import traceback
+from typing import Dict, List, Set, Optional, Type, Tuple, Self, Generic
 from dataclasses import dataclass
 from ..core.procedure import Procedure, Sigma, End
 from ..core.event import Event
 from . import make_prompt, Prompt
 from collections import defaultdict
 from functools import lru_cache
+from ..utils import Log
 
 
 @dataclass
@@ -56,7 +59,7 @@ class ProcedureEdge:
     from_procedure: ProcedureNode
     to_procedure: ProcedureNode
     event_type: Type[Event]
-    condition: str
+    condition: List[ast.expr]
     is_error_recovery: bool = False
 
 
@@ -82,9 +85,13 @@ class ProcedureGraph:
     def get_successors(self, procedure_name: str, prompt: str) -> List[ProcedureNode]:
         """Get all procedures that can be reached from the given procedure."""
         return [edge.to_procedure for edge in self.edges.get((procedure_name, prompt), [])]
+    
+    def has_node(self, node: ProcedureNode) -> bool:
+        """Check if the graph contains the given procedure node."""
+        return node.to_key() in self.nodes
 
 
-class ProcedureGraphBuilder:
+class ProcedureGraphBuilder(Generic[Sigma]):
     """Builds a procedure graph through reflection and analysis."""
     
     def __init__(self):
@@ -95,31 +102,233 @@ class ProcedureGraphBuilder:
     def build_graph(self, entry_procedure: Procedure[Sigma]) -> ProcedureGraph:
         """Build the complete procedure graph starting from the entry procedure."""
         self.context = inspect.getmodule(entry_procedure.__class__)
-        self.graph.entry_point = self._create_procedure_node(entry_procedure.__class__, str(entry_procedure.prompt))
-        self._discover_procedures(entry_procedure.__class__, str(entry_procedure.prompt))
-        self._build_transitions()
-        return self.graph
+        if not self.context:
+            raise ValueError("Entry procedure must be defined in a module.")
+        analysis = HandlerAnalysis(self.context)
+        analysis.init()
+        return analysis.construct_procedure_graph(entry_procedure)
+
+class HandlerAnalysis(ast.NodeVisitor):
+    """Analyzes a procedure hanlder and computes transitions
+       to the next procedure and their conditions (e.g., under an `if` statement).
+    """
+    class AnalysisScope:
+        def __init__(self, parent: Optional[Self] = None, path_condition: Optional[ast.expr] = None, escape: bool = False):
+            self.parent: Optional[Self] = parent
+            # map from expr hash to a tuple of (value, condition of assignment)
+            self.variables: Dict[int, ast.expr] = {}
+            self.path_condition = path_condition
+            self.escape = escape
+
+        def _name_hash(self, name: ast.expr) -> int:
+            if isinstance(name, ast.Name):
+                return hash(name.id)
+            elif isinstance(name, ast.Attribute):
+                return hash((name.attr, self._name_hash(name.value)))
+            elif isinstance(name, ast.Subscript):
+                return hash((self._name_hash(name.value), self._name_hash(name.slice)))
+            elif isinstance(name, ast.List):
+                return hash(tuple(self._name_hash(e) for e in name.elts))
+            elif isinstance(name, ast.Tuple):
+                return hash(tuple(self._name_hash(e) for e in name.elts))
+            elif isinstance(name, ast.Constant):
+                return hash(name.value)
+            raise TypeError(f"Unsupported name type for hashing during analysis: {type(name)}")
     
-    def _discover_procedures(self, procedure: Type[Procedure], prompt_text: str):
-        """Recursively discover all procedures reachable from the given procedure."""
-        # Create procedure node
-        node = self._create_procedure_node(procedure, prompt_text)
-        print(node)
-        if node.to_key() in self.graph.nodes:
-            # If already discovered, skip
+        def set_var(self, name: ast.expr, value: ast.expr):
+            name_hash = self._name_hash(name)
+            self.variables[name_hash] = value
+        
+        def get_var(self, name: ast.expr) -> Optional[ast.expr]:
+            """Get a variable value by its name."""
+            name_hash = self._name_hash(name)
+            return self.variables.get(name_hash, None)
+
+        def update(self, name: ast.expr, value):
+            self.set_var(name, value)
+            if self.parent and self.escape:
+                self.parent.update(name, value)
+        
+        def assign(self, name: ast.expr, value: ast.expr):
+            if self.parent:
+                current_value = self.parent.look_up(name)
+                if current_value is None:
+                    self.update(name, value)
+                else:
+                    # The variable is defined in a parent scope, update it with IfExpr
+                    new_value = ast.IfExp(test=ast.List(self.current_guard(), ctx=ast.Load()),
+                                          body=value, 
+                                          orelse=current_value)
+                    self.update(name, new_value)
+            else:
+                self.update(name, value)
+
+        
+        def look_up(self, name: ast.expr) -> Optional[ast.expr]:
+            """Look up a variable in the current scope or parent scopes."""
+            name_hash = self._name_hash(name)
+            if name_hash in self.variables:
+                return self.variables[name_hash]
+            if self.parent:
+                return self.parent.look_up(name)
+            return None
+        
+        @lru_cache
+        def current_guard(self) -> List[ast.expr]:
+            if self.parent is None:
+                if self.path_condition:
+                    return [self.path_condition]
+                return []
+            else:
+                parent_guard = self.parent.current_guard()
+                if self.path_condition:
+                    return parent_guard + [self.path_condition]
+                return parent_guard
+        
+        def push(self, path_condition: Optional[ast.expr] = None, escape: bool = True) -> 'HandlerAnalysis.AnalysisScope':
+            """Push a new scope with an optional path condition."""
+            return HandlerAnalysis.AnalysisScope(parent=self, path_condition=path_condition, escape=escape)
+        
+        def pop(self) -> 'HandlerAnalysis.AnalysisScope':
+            """Pop the current scope and return the parent scope."""
+            if self.parent is None:
+                raise RuntimeError("Cannot pop from the root scope.")
+
+            return self.parent
+            
+
+    def __init__(self, ctx: types.ModuleType):
+        super().__init__()
+        self.scope: HandlerAnalysis.AnalysisScope = HandlerAnalysis.AnalysisScope()
+        self.cond = None
+        self.escapes = [True]
+        self.ctx = ctx
+        self.current_node: Optional[ProcedureNode] = None
+        self.current_handler: Optional[HandlerInfo] = None
+        self.next_neighbor: List[ProcedureNode] = []
+        self.graph = ProcedureGraph()
+    
+    def init(self):
+        """Initialize the analysis with a new scope."""
+        self.scope = HandlerAnalysis.AnalysisScope()
+        self.cond = None
+        self.current_node = None
+        self.current_handler = None
+        self.next_neighbor = []
+    
+    def path(self, cond: Optional[ast.expr] = None) -> Self:
+        self.cond = cond
+        return self
+
+    def __enter__(self):
+        self.scope = self.scope.push(self.cond, escape=self.escapes[-1])
+        return self
+    
+    def __exit__(self, exc_type, exc_value, _tb):
+        if exc_type is not None:
+            Log.warning(f"Exception occurred during handler analysis: {exc_value}.\nStack trace: {traceback.format_exc()}")
+        self.scope = self.scope.pop()
+        self.cond = None
+    
+    def current_guard(self) -> List[ast.expr]:
+        """Get the current path condition as a list of expressions."""
+        return self.scope.current_guard()
+
+    def assign(self, name: ast.expr, value: ast.expr):
+        """Assign a variable in the current stack frame."""
+        try:
+            self.scope.assign(name, value)
+        except TypeError as e:
+            Log.error(f"Assignment type not supported at {self.error_loc(name)}: {e}")
+            exit(1)
+        except Exception as e:
+            raise e
+
+    def look_up(self, name: ast.expr) -> Optional[ast.expr]:
+        """Look up a variable in the current stack frame."""
+        return self.scope.look_up(name)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        with self:
+            for arg in node.args.args:
+                self.assign(ast.Name(id=arg.arg, ctx=ast.Load()), ast.Name(id=arg.arg, ctx=ast.Load()))
+            for kwarg in node.args.kwonlyargs:
+                self.assign(ast.Name(id=kwarg.arg, ctx=ast.Load()), ast.Name(id=kwarg.arg, ctx=ast.Load()))
+            for body_node in node.body:
+                self.visit(body_node)
+
+    def visit_If(self, node: ast.If):
+        with self.path(node.test):
+            for body_node in node.body:
+                self.visit(body_node)
+
+        with self.path(ast.UnaryOp(op=ast.Not(), operand=node.test)):
+            for orelse_node in node.orelse:
+                self.visit(orelse_node)
+    
+    def visit_Assign(self, node: ast.Assign):
+        """Handle variable assignments."""
+        for target in node.targets:
+            self.assign(target, node.value)
+    
+    def visit_Return(self, node: ast.Return):
+        if not self.current_handler:
+            raise ValueError("No current handler set for return statement.")
+        if not self.graph:
+            raise ValueError("No graph set for return statement.")
+        if not node.value:
+            raise ValueError("Return statement must have a value. ()")
+        succ = self._extract_successor(node.value)
+        if not succ:
             return
-        
-        self.discovered_procedures.add((procedure, prompt_text))
-        self.graph.add_node(node)
-        
-        # Discover connected procedures through handlers
-        for handler_info in node.handlers.values():
-            # Analyze handler to find returned procedure types
-            returned_procedures = self._analyze_handler_returns(procedure, handler_info.method_name)
-            for (proc_class, prompt) in returned_procedures:
-                if (proc_class, prompt_text) not in self.discovered_procedures:
-                    self._discover_procedures(proc_class, prompt)
-    
+        assert self.current_node is not None, "No current procedure node set for return statement."
+        self.graph.add_node(succ)
+        edge = ProcedureEdge(
+            from_procedure=self.current_node,
+            to_procedure=succ,
+            event_type=self.current_handler.event_type,
+            condition=self.current_guard()
+        )
+        self.graph.add_edge(edge)
+        self.next_neighbor.append(succ)
+
+
+    def error_loc(self, node) -> str:
+        """Get the location of an AST node for error reporting."""
+        return f"line {node.lineno}, column {node.col_offset} in {inspect.getfile(self.ctx)}"
+
+    def construct_procedure_graph(self, entry: Procedure[Sigma]) -> ProcedureGraph:
+        # construct the node for entry procedure
+        entry_node = self._create_procedure_node(entry.__class__, str(entry.prompt))
+        worklist = [entry_node]
+        self.graph.add_node(entry_node)
+        self.graph.entry_point = entry_node
+        visited = set()
+        # Construct by BFS
+        while worklist:
+            now, *worklist = worklist
+            if now.to_key() in visited:
+                continue
+            visited.add(now.to_key())
+            self.current_node = now
+            self.next_neighbor = []
+            for handler_info in now.handlers.values():
+                self.current_handler = handler_info
+                # Get the handler method from the procedure class
+                handler_method = getattr(now.procedure, handler_info.method_name, None)
+                if not handler_method:
+                    Log.warning(f"Handler method {handler_info.method_name} not found in {now.name}.")
+                    continue
+                
+                # Analyze the handler method's AST
+                handler_ast = ast.parse(textwrap.dedent(inspect.getsource(handler_method)))
+                self.visit(handler_ast)
+                
+                # Add all successors to the worklist
+                for succ in self.next_neighbor:
+                    worklist.append(succ)
+        return self.graph
+
     def _create_procedure_node(self, procedure: Type[Procedure], prompt: Optional[str] = None) -> ProcedureNode:
         """Create a procedure node by analyzing the procedure class."""
         name = procedure.__name__
@@ -193,33 +402,9 @@ class ProcedureGraphBuilder:
                 )
         
         return handlers
-    
-    def _analyze_handler_returns(self, procedure: Type[Procedure], method_name: str) -> Set[Tuple[Type[Procedure], str]]:
-        """Analyze a handler method to find what procedure types it can return."""
-        returned_procedures = set()
-        
-        try:
-            method = getattr(procedure, method_name)
-            (source, _lineno) = inspect.getsourcelines(method)
-            src = [textwrap.fill(src, tabsize=4, width=9999) for src in source]
-            
-            # Parse the AST to find return statements
-            tree = ast.parse(textwrap.dedent('\n'.join(src)))
-            print("Analyzing handler:", procedure.__name__, method_name)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Return) and node.value:
-                    returned_procedures.update(self._extract_procedure_types_from_ast(node.value))
-        
-        except (OSError, TypeError):
-            # If source is not available, skip AST analysis
-            pass
-        
-        return returned_procedures
-    
-    def _extract_procedure_types_from_ast(self, node: ast.AST) -> Set[Tuple[Type[Procedure], str]]:
-        """Extract procedure types from AST nodes."""
-        procedure_types = set()
 
+    def _extract_successor(self, node: ast.AST) -> Optional[ProcedureNode]:
+        """Extract procedure types from AST nodes."""
         def _try_extract_prompt_from_call(node: ast.expr) -> Optional[str]:
             if not isinstance(node, ast.Call):
                 return None
@@ -244,51 +429,28 @@ class ProcedureGraphBuilder:
             if isinstance(node.func, ast.Name):
                 class_name = node.func.id
                 # Try to resolve the class name to an actual class
-                proc_class = getattr(self.context, class_name, None)
+                proc_class = getattr(self.ctx, class_name, None)
                 if not proc_class or not issubclass(proc_class, Procedure):
-                    return procedure_types
-                # Add the procedure class and its prompt text
-                procedure_types.add((proc_class, prompt_txt if prompt_txt else str(proc_class.prompt)))
+                    return None
+                return self._create_procedure_node(proc_class, prompt_txt if prompt_txt else str(proc_class.prompt))
         
         elif isinstance(node, ast.Name):
+            # return `self`
+            if node.id == 'self':
+                assert self.current_node is not None, "No current procedure node set for self reference."
+                # Use the current procedure node's class and prompt text
+                return self.current_node
             # Direct class reference
-            proc_class = getattr(self.context, node.id, None)
+            proc_class = getattr(self.ctx, node.id, None)
             if proc_class and issubclass(proc_class, Procedure):
                 # If it's a procedure class, add it with its default prompt
-                procedure_types.add((proc_class, str(proc_class.prompt)))
-        
-        return procedure_types
-    
-    def _build_transitions(self):
-        """Build transition edges between procedures."""
-        for (name, prompt), node in self.graph.nodes.items():
-            for event_type, handler_info in node.handlers.items():
-                # Find procedures returned by this handler
-                returned_procedures = self._analyze_handler_returns(node.procedure, handler_info.method_name)
-                
-                for (target_procedure, prompt) in returned_procedures:
-                    target_name = target_procedure.__name__
-                    if (target_name, prompt) not in self.graph.nodes:
-                        # If the target procedure is not yet in the graph, create it
-                        assert False, f"Target procedure {target_name}, {prompt} not found in the graph. Ensure it is defined and reachable."
-                        target_node = self._create_procedure_node(target_procedure, prompt)
-                        self.graph.add_node(target_node)
-                    else:
-                        target_node = self.graph.nodes[target_name, prompt]
-                    
-                    # Create edge
-                    condition = f"When {event_type.__name__} occurs"
-                    is_error_recovery = handler_info.returns_string
-                    
-                    edge = ProcedureEdge(
-                        from_procedure=node,
-                        to_procedure=target_node,
-                        event_type=event_type,
-                        condition=condition,
-                        is_error_recovery=is_error_recovery
-                    )
-                    
-                    self.graph.add_edge(edge)
+                return self._create_procedure_node(proc_class, str(proc_class.prompt))
+        elif isinstance(node, ast.JoinedStr | ast.Constant):
+            return None
+
+        Log.warning(f"Cannot extract procedure from AST node: {ast.dump(node)} at {self.error_loc(node)}")
+        return None
+
 
 class PromptBuilder:
     """Builds SOP prompts from procedure graphs."""

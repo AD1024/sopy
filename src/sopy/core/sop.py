@@ -31,25 +31,26 @@ class SOP(Generic[Sigma]):
         # TODO: implement for LangGraph and strands
         ...
 
-    def observe(self, stream: Iterable) -> Prompt | None:
+    def observe(self, stream: Iterable) -> Iterable:
         if not self._sop_ctx:
             raise RuntimeError(f"`observe` should not be called outside of SOP context. Use `with` to enter the context.")
         for e in self.unwrap_iter(stream):
             try:
                 nxt = self.current_proc._handle(self.state, e)
+                if isinstance(nxt, str):
+                    yield make_prompt(nxt)
+                elif isinstance(nxt, Procedure):
+                    self.current_proc = nxt
+                    yield e
+                else:
+                    raise ValueError(f"Unexpected return type from handler: {type(nxt)}. Expected str or Procedure.")
             except AssertionError | SOPViolation as ex:
-                return make_prompt(f"SOP Violation detected: {ex}. Please try again.")
+                yield make_prompt(f"SOP Violation detected: {ex}. Please try again.")
             except Exception as ex:
                 # usually internal errors due to bugs in SOP implementation
                 raise ex
-            if isinstance(nxt, str):
-                return make_prompt(nxt)
-            elif isinstance(nxt, Procedure):
-                self.current_proc = nxt
-            else:
-                raise ValueError(f"Unexpected return type from handler: {type(nxt)}. Expected str or Procedure.")
         if not isinstance(self.current_proc, End):
-            return make_prompt(f"SOP left unfinished: current procedure is {self.current_proc.__class__.__name__}.")
+            yield make_prompt(f"SOP left unfinished: current procedure is {self.current_proc.__class__.__name__}.")
 
     def __enter__(self):
         """
