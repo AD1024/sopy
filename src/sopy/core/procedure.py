@@ -63,5 +63,7 @@ class Procedure(Generic[Sigma]):
             
 
 class End(Procedure[Sigma]):
+    prompt: Prompt = make_prompt("Finish the procedure, and report related results to the user")
+
     def __init__(self, prompt: Prompt | None = None):
-        self.prompt = prompt if prompt else make_prompt("End of the procedure. No further actions required.")
+        self.prompt = prompt if prompt else self.prompt

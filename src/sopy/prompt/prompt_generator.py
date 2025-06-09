@@ -18,6 +18,7 @@ class HandlerInfo:
     """Information about an event handler method."""
     method_name: str
     event_type: Type[Event]
+    ctx: Dict[int, ast.expr]
     returns_procedure: bool
     returns_string: bool
     docstring: Optional[str] = None
@@ -113,35 +114,39 @@ class HandlerAnalysis(ast.NodeVisitor):
        to the next procedure and their conditions (e.g., under an `if` statement).
     """
     class AnalysisScope:
-        def __init__(self, parent: Optional[Self] = None, path_condition: Optional[ast.expr] = None, escape: bool = False):
+        def __init__(self, ctx: Dict[int, ast.expr] = {}, parent: Optional[Self] = None,
+                     path_condition: Optional[ast.expr] = None, escape: bool = False):
             self.parent: Optional[Self] = parent
             # map from expr hash to a tuple of (value, condition of assignment)
-            self.variables: Dict[int, ast.expr] = {}
+            self.variables: Dict[int, ast.expr] = ctx
             self.path_condition = path_condition
             self.escape = escape
 
-        def _name_hash(self, name: ast.expr) -> int:
+        @staticmethod
+        @lru_cache
+        def name_hash(name: ast.expr) -> int:
+            This = HandlerAnalysis.AnalysisScope
             if isinstance(name, ast.Name):
                 return hash(name.id)
             elif isinstance(name, ast.Attribute):
-                return hash((name.attr, self._name_hash(name.value)))
+                return hash((name.attr, This.name_hash(name.value)))
             elif isinstance(name, ast.Subscript):
-                return hash((self._name_hash(name.value), self._name_hash(name.slice)))
+                return hash((This.name_hash(name.value), This.name_hash(name.slice)))
             elif isinstance(name, ast.List):
-                return hash(tuple(self._name_hash(e) for e in name.elts))
+                return hash(tuple(This.name_hash(e) for e in name.elts))
             elif isinstance(name, ast.Tuple):
-                return hash(tuple(self._name_hash(e) for e in name.elts))
+                return hash(tuple(This.name_hash(e) for e in name.elts))
             elif isinstance(name, ast.Constant):
                 return hash(name.value)
             raise TypeError(f"Unsupported name type for hashing during analysis: {type(name)}")
     
         def set_var(self, name: ast.expr, value: ast.expr):
-            name_hash = self._name_hash(name)
+            name_hash = self.name_hash(name)
             self.variables[name_hash] = value
         
         def get_var(self, name: ast.expr) -> Optional[ast.expr]:
             """Get a variable value by its name."""
-            name_hash = self._name_hash(name)
+            name_hash = self.name_hash(name)
             return self.variables.get(name_hash, None)
 
         def update(self, name: ast.expr, value):
@@ -166,7 +171,7 @@ class HandlerAnalysis(ast.NodeVisitor):
         
         def look_up(self, name: ast.expr) -> Optional[ast.expr]:
             """Look up a variable in the current scope or parent scopes."""
-            name_hash = self._name_hash(name)
+            name_hash = self.name_hash(name)
             if name_hash in self.variables:
                 return self.variables[name_hash]
             if self.parent:
@@ -296,6 +301,10 @@ class HandlerAnalysis(ast.NodeVisitor):
     def error_loc(self, node) -> str:
         """Get the location of an AST node for error reporting."""
         return f"line {node.lineno}, column {node.col_offset} in {inspect.getfile(self.ctx)}"
+    
+    def set_context(self, ctx: Dict[int, ast.expr]):
+        assert self.scope.parent is None, "Cannot set context in a non-root scope."
+        self.scope = HandlerAnalysis.AnalysisScope(ctx=ctx, escape=False)
 
     def construct_procedure_graph(self, entry: Procedure[Sigma]) -> ProcedureGraph:
         # construct the node for entry procedure
@@ -322,6 +331,7 @@ class HandlerAnalysis(ast.NodeVisitor):
                 
                 # Analyze the handler method's AST
                 handler_ast = ast.parse(textwrap.dedent(inspect.getsource(handler_method)))
+                self.set_context(handler_info.ctx)
                 self.visit(handler_ast)
                 
                 # Add all successors to the worklist
@@ -398,6 +408,7 @@ class HandlerAnalysis(ast.NodeVisitor):
                     event_type=event_type,
                     returns_procedure=returns_procedure,
                     returns_string=returns_string,
+                    ctx={},
                     docstring=inspect.getdoc(attr)
                 )
         
@@ -452,159 +463,601 @@ class HandlerAnalysis(ast.NodeVisitor):
         return None
 
 
-class PromptBuilder:
-    """Builds SOP prompts from procedure graphs."""
-    
-    def __init__(self, format_style: str = "natural_language"):
-        self.format_style = format_style
-    
-    def build_sop_prompt(self, graph: ProcedureGraph, objective: str = "") -> str:
-        """Build a complete SOP prompt from the procedure graph."""
-        if self.format_style == "natural_language":
-            return self._build_natural_language_prompt(graph, objective)
-        else:
-            raise ValueError(f"Unsupported format style: {self.format_style}")
-    
-    def _build_natural_language_prompt(self, graph: ProcedureGraph, objective: str) -> str:
-        """Build a natural language SOP prompt."""
-        sections = []
-        
-        # Header
-        if objective:
-            sections.append(f"STANDARD OPERATING PROCEDURE\n\nOBJECTIVE: {objective}\n")
-        else:
-            sections.append("STANDARD OPERATING PROCEDURE\n")
-        
-        # Main procedure flow
-        sections.append("MAIN PROCEDURE:")
-        main_flow = self._build_main_flow(graph)
-        sections.append(main_flow)
-        
-        # Error handling
-        error_handling = self._build_error_handling(graph)
-        if error_handling:
-            sections.append("\nERROR HANDLING:")
-            sections.append(error_handling)
-        
-        # Completion criteria
-        completion = self._build_completion_criteria(graph)
-        if completion:
-            sections.append("\nCOMPLETION:")
-            sections.append(completion)
-        
-        return "\n".join(sections)
-    
-    def _build_main_flow(self, graph: ProcedureGraph) -> str:
-        """Build the main procedure flow description."""
-        if not graph.entry_point:
-            return "No entry point defined."
-        
-        flow_steps = []
-        visited = set()
-        step_number = 1
-        
-        # Perform a traversal to build the main flow
-        def traverse_main_path(node: ProcedureNode, depth: int = 0):
-            nonlocal step_number
-            key = node.to_key()
-            
-            if key in visited or key not in graph.nodes:
-                return
-            
-            visited.add(key)
-            
-            # Build step description
-            step_desc = f"{step_number}. {node.name.upper()}: {node.prompt_text}"
-            
-            # Add transition information
-            successors = graph.get_successors(*key)
-            non_error_successors = [
-                succ for succ in successors 
-                if not any(edge.is_error_recovery for edge in graph.edges[key] 
-                          if edge.from_procedure == node and edge.to_procedure == succ)
-            ]
-            
-            if non_error_successors:
-                # Find the events that lead to successors
-                events_to_successors = {}
-                for edge in graph.edges[key]:
-                    if edge.from_procedure == node and edge.to_procedure in non_error_successors:
-                        events_to_successors[edge.to_procedure] = edge.event_type.__name__
-                
-                if len(non_error_successors) == 1:
-                    next_proc = non_error_successors[0]
-                    event_name = events_to_successors.get(next_proc, "completion")
-                    step_desc += f" Wait for {event_name} event, then proceed to {next_proc.name}."
-                else:
-                    step_desc += " Depending on the event received, proceed to the appropriate next step."
-            
-            flow_steps.append(step_desc)
-            step_number += 1
-            
-            # Continue with the main path (first non-error successor)
-            if non_error_successors:
-                traverse_main_path(non_error_successors[0], depth + 1)
-        
-        traverse_main_path(graph.entry_point)
-        
-        return "\n".join(flow_steps)
-    
-    def _build_error_handling(self, graph: ProcedureGraph) -> str:
-        """Build error handling descriptions."""
-        error_cases = []
-        
-        for edges in graph.edges.values():
-            for edge in edges:
-                if edge.is_error_recovery:
-                    error_desc = f"- If {edge.event_type.__name__} fails or causes errors: {edge.condition}"
-                    error_cases.append(error_desc)
-        
-        # Add general error handling
-        error_cases.append("- If unrecognized events occur: Request clarification and continue with current procedure")
-        error_cases.append("- If procedure violations are detected: Provide specific recovery instructions")
-        
-        return "\n".join(error_cases)
-    
-    def _build_completion_criteria(self, graph: ProcedureGraph) -> str:
-        """Build completion criteria description."""
-        if not graph.end_points:
-            return "The procedure completes when no further transitions are possible."
-        
-        end_descriptions = []
-        for end_point in graph.end_points:
-            if end_point in graph.nodes:
-                node = graph.nodes[end_point]
-                if hasattr(node.procedure, 'prompt'):
-                    # For End procedures with action descriptions
-                    end_descriptions.append(f"- {end_point}: {node.prompt_text}")
-                else:
-                    end_descriptions.append(f"- {end_point}: Procedures complete with no further actions required.")
-        
-        if end_descriptions:
-            return "The procedure completes successfully when:\n" + "\n".join(end_descriptions)
-        else:
-            return "The procedure completes when the terminal state is reached."
-
-
-def make_prompt_from_procedure(p: Procedure[Sigma], objective: str = "", format_style: str = "natural_language") -> Prompt:
+def make_prompt_from_procedure(entry_procedure: Procedure[Sigma], objective: str = "") -> str:
     """
-    Generate an SOP prompt from a procedure by building and traversing the procedure graph.
+    Generate a natural language system prompt from a ProcedureGraph.
     
     Args:
-        p: The entry procedure to start building the graph from
-        objective: Optional objective description for the SOP
-        format_style: The format style for the prompt (default: "natural_language")
+        entry_procedure: The starting procedure for the SOP
+        objective: Optional description of the overall objective
     
     Returns:
-        Prompt: A prompt containing the complete SOP description
+        A formatted SOP prompt string
     """
     # Build the procedure graph
     builder = ProcedureGraphBuilder()
-    graph = builder.build_graph(p)
-    print(graph.edges.keys(), graph.nodes.keys())
+    graph = builder.build_graph(entry_procedure)
     
     # Generate the prompt
-    prompt_builder = PromptBuilder(format_style)
-    prompt_text = prompt_builder.build_sop_prompt(graph, objective)
+    generator = SOPPromptGenerator()
+    return generator.generate_prompt(graph, objective)
+
+
+class SOPPromptGenerator:
+    """Generates natural language SOP prompts from procedure graphs."""
     
-    return make_prompt(prompt_text)
+    def __init__(self):
+        self.visited_nodes = set()
+        self.step_counter = 1
+        
+    def generate_prompt(self, graph: ProcedureGraph, objective: str = "") -> str:
+        """Generate the complete SOP prompt."""
+        if not graph.entry_point:
+            return "No entry point found in procedure graph."
+        
+        # Generate header
+        header = "Here is the standard operating procedure (SOP)"
+        if objective:
+            header += f" for {objective}"
+        header += ":\n"
+        
+        # Generate steps using topological order
+        self.visited_nodes = set()
+        self.step_counter = 1
+        steps = self._generate_steps_topological(graph)
+        
+        return header + "\n".join(steps)
+    
+    def _get_topological_order(self, graph: ProcedureGraph) -> List[ProcedureNode]:
+        """Get nodes in topological order to avoid terminal nodes appearing before their predecessors."""
+        # Use Kahn's algorithm for topological sorting
+        in_degree = {}
+        all_nodes = list(graph.nodes.values())
+        
+        # Initialize in-degree count
+        for node in all_nodes:
+            in_degree[node.to_key()] = 0
+        
+        # Calculate in-degrees
+        for node_key, edges in graph.edges.items():
+            for edge in edges:
+                if edge.to_procedure.to_key() != edge.from_procedure.to_key():  # Skip self-loops
+                    in_degree[edge.to_procedure.to_key()] = in_degree.get(edge.to_procedure.to_key(), 0) + 1
+        
+        # Start with nodes that have no incoming edges
+        queue = [node for node in all_nodes if in_degree[node.to_key()] == 0]
+        result = []
+        
+        while queue:
+            # Get node with zero in-degree
+            current = queue.pop(0)
+            result.append(current)
+            
+            # Process all outgoing edges
+            outgoing_edges = graph.edges.get((current.name, current.prompt_text), [])
+            for edge in outgoing_edges:
+                if edge.to_procedure.to_key() != current.to_key():  # Skip self-loops
+                    in_degree[edge.to_procedure.to_key()] -= 1
+                    if in_degree[edge.to_procedure.to_key()] == 0:
+                        queue.append(edge.to_procedure)
+        
+        return result
+    
+    def _generate_steps_topological(self, graph: ProcedureGraph) -> List[str]:
+        """Generate steps using topological ordering to ensure correct sequence."""
+        steps = []
+        
+        # Get nodes in topological order
+        ordered_nodes = self._get_topological_order(graph)
+        
+        # Process each node in topological order
+        for node in ordered_nodes:
+            if node.to_key() in self.visited_nodes:
+                continue
+                
+            self.visited_nodes.add(node.to_key())
+            
+            # Skip empty prompt nodes
+            if not node.prompt_text.strip():
+                continue
+            
+            # Get outgoing edges
+            outgoing_edges = graph.edges.get((node.name, node.prompt_text), [])
+            
+            # Detect pattern
+            pattern = self._detect_transition_pattern(node, outgoing_edges)
+            
+            # Skip self-loop only patterns
+            if pattern == "self_loop_only":
+                continue
+            
+            # Generate step text
+            step_text = self._generate_step_text(node, outgoing_edges, pattern)
+            if step_text.strip():  # Only add non-empty steps
+                steps.append(step_text)
+        
+        return steps
+    
+    def _generate_steps(self, graph: ProcedureGraph, node: ProcedureNode) -> List[str]:
+        """Generate steps starting from the given node."""
+        steps = []
+        
+        if node.to_key() in self.visited_nodes:
+            return steps
+        
+        self.visited_nodes.add(node.to_key())
+        
+        # Skip empty prompt nodes
+        if not node.prompt_text.strip():
+            # Process successors without creating a step
+            for edge in graph.edges.get((node.name, node.prompt_text), []):
+                if edge.to_procedure != node:
+                    successor_steps = self._generate_steps(graph, edge.to_procedure)
+                    steps.extend(successor_steps)
+            return steps
+        
+        # Get outgoing edges
+        outgoing_edges = graph.edges.get((node.name, node.prompt_text), [])
+        
+        # Detect pattern
+        pattern = self._detect_transition_pattern(node, outgoing_edges)
+        
+        # Skip self-loop only patterns
+        if pattern == "self_loop_only":
+            return steps
+        
+        # Generate step text
+        step_text = self._generate_step_text(node, outgoing_edges, pattern)
+        if step_text.strip():  # Only add non-empty steps
+            steps.append(step_text)
+        
+        # Process successor nodes with better deduplication
+        processed_successors = set()
+        for edge in outgoing_edges:
+            if (edge.to_procedure != node and 
+                edge.to_procedure.to_key() not in processed_successors and
+                edge.to_procedure.to_key() not in self.visited_nodes):
+                processed_successors.add(edge.to_procedure.to_key())
+                successor_steps = self._generate_steps(graph, edge.to_procedure)
+                steps.extend(successor_steps)
+        
+        return steps
+    
+    def _detect_transition_pattern(self, node: ProcedureNode, outgoing_edges: List[ProcedureEdge]) -> str:
+        """Detect the pattern type based on current node and its outgoing transitions."""
+        
+        # Categorize edges
+        self_loops = [e for e in outgoing_edges if e.to_procedure == node]
+        non_self_edges = [e for e in outgoing_edges if e.to_procedure != node]
+        terminal_edges = [e for e in non_self_edges if e.to_procedure.is_terminal]
+        
+        # Pattern detection
+        if len(non_self_edges) == 0 and len(self_loops) > 0:
+            return "self_loop_only"
+        elif len(non_self_edges) == 1 and len(self_loops) == 0:
+            return "sequential_flow"
+        elif len(non_self_edges) > 1:
+            return "conditional_branching"
+        elif len(self_loops) > 0 and len(non_self_edges) > 0:
+            return "retry_with_progression"
+        elif len(terminal_edges) > 0:
+            return "terminal_transition"
+        else:
+            return "complex_pattern"
+    
+    def _generate_step_text(self, node: ProcedureNode, outgoing_edges: List[ProcedureEdge], pattern: str) -> str:
+        """Generate the step text for a given node and pattern."""
+        if node.name == "End":
+            return ""
+        step_text = f"Procedure {node.name}:\n"
+        
+        # Ensure proper punctuation for the instruction - remove trailing periods first
+        instruction = node.prompt_text.strip().rstrip('.')
+        step_text += f"    Instruction: {instruction}"
+        
+        # Add pattern-specific transition description
+        transition_text = ""
+        if pattern == "sequential_flow":
+            transition_text = self._translate_sequential_flow(outgoing_edges)
+        elif pattern == "conditional_branching":
+            transition_text = self._translate_conditional_branching(outgoing_edges)
+        elif pattern == "retry_with_progression":
+            transition_text = self._translate_retry_pattern(node, outgoing_edges)
+        elif pattern == "terminal_transition":
+            transition_text = self._translate_terminal_transitions(outgoing_edges)
+        
+        # Add transition text and ensure proper punctuation
+        if transition_text:
+            step_text += transition_text
+        
+        # Ensure the instruction ends with a period
+        if not step_text.rstrip().endswith('.'):
+            step_text += '.'
+        
+        # Add action information
+        actions = [edge.event_type.__name__ for edge in outgoing_edges if edge.event_type]
+        unique_actions = list(set(actions))
+        if unique_actions:
+            step_text += f"\n    Action: {', '.join(unique_actions)}"
+        
+        self.step_counter += 1
+        return step_text
+    
+    def _translate_sequential_flow(self, edges: List[ProcedureEdge]) -> str:
+        """Translate sequential flow pattern."""
+        if not edges:
+            return ""
+        
+        edge = edges[0]
+        target_text = self._get_meaningful_target_description(edge)
+        
+        if not target_text:
+            return ""
+            
+        if edge.condition:
+            condition_text = self._translate_conditions(edge.condition)
+            if condition_text and condition_text != "the condition is met":
+                return f" If {condition_text}, then {target_text}."
+        else:
+            # For unconditional sequential flow, just mention it proceeds to next step
+            return f" Then proceed to {edge.to_procedure.name}."
+        Log.warning(f"Unexpected edge condition: {edge.condition} for edge {edge.from_procedure.name} -> {edge.to_procedure.name}")
+        return ""
+    
+    def _translate_conditional_branching(self, edges: List[ProcedureEdge]) -> str:
+        """Translate conditional branching pattern."""
+        if not edges:
+            return ""
+        
+        # Filter out self-loops and group by target
+        non_self_edges = [e for e in edges if e.to_procedure.prompt_text != e.from_procedure.prompt_text]
+        if not non_self_edges:
+            return ""
+        
+        conditions = []
+        else_edges = []
+        
+        for edge in non_self_edges:
+            # Get target description first
+            target_text = self._get_meaningful_target_description(edge)
+            
+            # Only process edges with meaningful targets
+            if target_text:
+                if edge.condition:
+                    condition_text = self._translate_conditions(edge.condition)
+                    # if condition_text and condition_text != "the condition is met":
+                    #     conditions.append(f"If {condition_text}, then {target_text}")
+                    if condition_text:
+                        conditions.append(f"If {condition_text}, then go to {edge.to_procedure.name}")
+                else:
+                    else_edges.append(edge)
+        
+        # Add else cases (only if we have meaningful targets)
+        for edge in else_edges:
+            target_text = self._get_meaningful_target_description(edge)
+            if target_text:
+                conditions.append(f"Otherwise, go to {edge.to_procedure.name}")
+        
+        if conditions:
+            return ". " + ". ".join(conditions) + "."
+        return ""
+    
+    def _get_meaningful_target_description(self, edge: ProcedureEdge) -> Optional[str]:
+        """Get a meaningful description of the target procedure, avoiding repetition."""
+        target_prompt = edge.to_procedure.prompt_text.strip()
+        current_prompt = edge.from_procedure.prompt_text.strip()
+        
+        # For terminal nodes, always use special wording regardless of prompt
+        if edge.to_procedure.is_terminal:
+            return "finish the procedure"
+            
+        # Skip if target prompt is empty or the same as current
+        if not target_prompt or target_prompt == current_prompt:
+            return None
+            
+        # Use the target prompt, but make it concise
+        return target_prompt.lower()
+    
+    def _translate_retry_pattern(self, node: ProcedureNode, edges: List[ProcedureEdge]) -> str:
+        """Translate retry with progression pattern."""
+        self_edges = [e for e in edges if e.to_procedure == node]
+        progression_edges = [e for e in edges if e.to_procedure != node]
+        
+        parts = []
+        
+        # Add retry conditions
+        retry_conditions = []
+        for edge in self_edges:
+            if edge.condition:
+                condition_text = self._translate_conditions(edge.condition)
+                retry_conditions.append(condition_text)
+        
+        if retry_conditions:
+            parts.append(f"If {' or '.join(retry_conditions)}, try again")
+        
+        # Add progression conditions
+        for edge in progression_edges:
+            if edge.condition:
+                condition_text = self._translate_conditions(edge.condition)
+                action_text = edge.to_procedure.prompt_text.lower()
+                parts.append(f"If {condition_text}, then {action_text}")
+        
+        if parts:
+            return ". " + ". ".join(parts) + "."
+        return ""
+    
+    def _translate_terminal_transitions(self, edges: List[ProcedureEdge]) -> str:
+        """Translate transitions to terminal nodes."""
+        terminal_edges = [e for e in edges if e.to_procedure.is_terminal]
+        
+        if not terminal_edges:
+            return ""
+        
+        conditions = []
+        for edge in terminal_edges:
+            if edge.condition:
+                condition_text = self._translate_conditions(edge.condition)
+                conditions.append(f"If {condition_text}, then finish the procedure")
+            else:
+                conditions.append("Then finish the procedure")
+        
+        if conditions:
+            return ". " + ". ".join(conditions)
+        return ""
+    
+    def _translate_conditions(self, conditions: List[ast.expr]) -> str:
+        """Translate a list of AST conditions to natural language."""
+        if not conditions:
+            return ""
+        
+        translated = []
+        for condition in conditions:
+            translated.append(self._translate_single_condition(condition))
+        
+        return " and ".join(translated)
+    
+    def _translate_single_condition(self, condition: ast.expr) -> str:
+        """Translate a single AST condition to natural language."""
+        try:
+            if isinstance(condition, ast.Call):
+                # Handle cond() function calls
+                if (isinstance(condition.func, ast.Name) and 
+                    condition.func.id == 'cond' and 
+                    len(condition.args) >= 2 and 
+                    isinstance(condition.args[1], ast.Constant)):
+                    return condition.args[1].value
+                
+            elif isinstance(condition, ast.Compare):
+                return self._translate_comparison(condition)
+            
+            elif isinstance(condition, ast.BoolOp):
+                return self._translate_bool_op(condition)
+            
+            elif isinstance(condition, ast.UnaryOp):
+                return self._translate_unary_op(condition)
+            
+            elif isinstance(condition, ast.Name):
+                return self._translate_name(condition)
+            
+            elif isinstance(condition, ast.Attribute):
+                return self._translate_attribute(condition)
+            
+            # Fallback: convert to source code
+            return ast.unparse(condition)
+            
+        except Exception as e:
+            Log.warning(f"Failed to translate condition: {e}")
+            return "the condition is met"
+    
+    def _translate_comparison(self, node: ast.Compare) -> str:
+        """Translate comparison operations."""
+        left = self._translate_expr_to_text(node.left)
+        
+        parts = [left]
+        for op, right in zip(node.ops, node.comparators):
+            op_text = self._translate_operator(op)
+            right_text = self._translate_expr_to_text(right)
+            parts.append(f"{op_text} {right_text}")
+        
+        return " ".join(parts)
+    
+    def _translate_bool_op(self, node: ast.BoolOp) -> str:
+        """Translate boolean operations (and, or)."""
+        op_text = "and" if isinstance(node.op, ast.And) else "or"
+        conditions = [self._translate_single_condition(value) for value in node.values]
+        return f" {op_text} ".join(conditions)
+    
+    def _translate_unary_op(self, node: ast.UnaryOp) -> str:
+        """Translate unary operations (not)."""
+        if isinstance(node.op, ast.Not):
+            operand = self._translate_single_condition(node.operand)
+            return f"not {operand}"
+        return ast.unparse(node)
+    
+    def _translate_name(self, node: ast.Name) -> str:
+        """Translate variable names."""
+        return node.id
+    
+    def _translate_attribute(self, node: ast.Attribute) -> str:
+        """Translate attribute access with potential Pydantic Field descriptions."""
+        # Try to get field description if available
+        field_desc = self._get_field_description(node)
+        if field_desc:
+            return field_desc
+        
+        # Fallback to readable attribute name
+        value_text = self._translate_expr_to_text(node.value)
+        return f"{value_text}.{node.attr}"
+    
+    def _translate_operator(self, op: ast.cmpop) -> str:
+        """Translate comparison operators."""
+        op_map = {
+            ast.Eq: "is",
+            ast.NotEq: "is not",
+            ast.Lt: "is less than",
+            ast.LtE: "is less than or equal to", 
+            ast.Gt: "is greater than",
+            ast.GtE: "is greater than or equal to",
+            ast.Is: "is",
+            ast.IsNot: "is not",
+            ast.In: "is in",
+            ast.NotIn: "is not in"
+        }
+        return op_map.get(type(op), "==")
+    
+    def _translate_expr_to_text(self, expr: ast.expr) -> str:
+        """Translate an expression to readable text."""
+        if isinstance(expr, ast.Name):
+            return expr.id
+        elif isinstance(expr, ast.Attribute):
+            field_desc = self._get_field_description(expr)
+            if field_desc:
+                return field_desc
+            value_text = self._translate_expr_to_text(expr.value)
+            return f"{value_text}.{expr.attr}"
+        elif isinstance(expr, ast.Constant):
+            if isinstance(expr.value, str):
+                return f"'{expr.value}'"
+            return str(expr.value)
+        else:
+            return ast.unparse(expr)
+    
+    def _get_field_description(self, attr_node: ast.Attribute) -> Optional[str]:
+        """Try to extract Pydantic Field description from attribute access."""
+        try:
+            # Try to resolve the field description from the actual class definition
+            return self._resolve_field_description(attr_node)
+        except Exception as e:
+            Log.warning(f"Failed to resolve field description for {ast.unparse(attr_node)}: {e}")
+            return None
+    
+    def _resolve_field_description(self, attr_node: ast.Attribute) -> Optional[str]:
+        """Resolve field description by inspecting the class definition."""
+        # This is a more sophisticated approach that tries to resolve the actual Field definitions
+        field_name = attr_node.attr
+        
+        # Try to determine the type of the object being accessed
+        # For now, we'll look for common patterns like sigma.field_name
+        if isinstance(attr_node.value, ast.Name):
+            var_name = attr_node.value.id
+            
+            # Look for type annotations in function signatures that might give us clues
+            # This is a simplified heuristic - in practice you'd need full type resolution
+            if var_name in ['sigma', 'state']:
+                # Try to find Sigma type or similar in the current context
+                field_desc = self._find_field_in_common_types(field_name)
+                if field_desc:
+                    return field_desc
+        
+        return None
+    
+    def _find_field_in_common_types(self, field_name: str) -> Optional[str]:
+        """Find field description in commonly used types."""
+        # This is a heuristic approach - we look for classes with Field definitions
+        # In practice, you'd want full type resolution
+        import sys
+        
+        # Look through loaded modules for BaseModel classes
+        for _, module in sys.modules.items():
+            if not module or not hasattr(module, '__dict__'):
+                continue
+                
+            try:
+                for attr_name in dir(module):
+                    attr_value = getattr(module, attr_name, None)
+                    if (isinstance(attr_value, type) and 
+                        hasattr(attr_value, '__annotations__') and
+                        hasattr(attr_value, '__dict__')):
+                        
+                        # Check if this looks like a BaseModel class
+                        if self._is_likely_basemodel(attr_value):
+                            desc = self._extract_field_description_from_class(attr_value, field_name)
+                            if desc:
+                                return desc
+            except Exception:
+                continue
+                
+        return None
+    
+    def _is_likely_basemodel(self, cls: type) -> bool:
+        """Check if a class is likely a BaseModel with Field definitions."""
+        try:
+            # Check if it has the typical BaseModel characteristics
+            if hasattr(cls, '__fields__'):  # Pydantic v1
+                return True
+            if hasattr(cls, 'model_fields'):  # Pydantic v2
+                return True
+            # Check for common BaseModel method names
+            if hasattr(cls, 'model_validate') or hasattr(cls, 'parse_obj'):
+                return True
+            # Check class hierarchy
+            for base in getattr(cls, '__mro__', []):
+                if base.__name__ == 'BaseModel':
+                    return True
+        except Exception:
+            pass
+        return False
+    
+    def _extract_field_description_from_class(self, cls: type, field_name: str) -> Optional[str]:
+        """Extract field description from a BaseModel class."""
+        try:
+            # Pydantic v2 approach
+            if hasattr(cls, 'model_fields') and field_name in cls.model_fields:
+                field_info = cls.model_fields[field_name]
+                if hasattr(field_info, 'description') and field_info.description:
+                    return field_info.description
+            
+            # Pydantic v1 approach
+            if hasattr(cls, '__fields__') and field_name in cls.__fields__:
+                field_info = cls.__fields__[field_name]
+                if hasattr(field_info, 'field_info') and hasattr(field_info.field_info, 'description'):
+                    return field_info.field_info.description
+            
+            # Fallback: inspect the class source for Field definitions
+            return self._extract_field_from_source(cls, field_name)
+            
+        except Exception as e:
+            Log.warning(f"Failed to extract field description from {cls.__name__}.{field_name}: {e}")
+            return None
+    
+    def _extract_field_from_source(self, cls: type, field_name: str) -> Optional[str]:
+        """Extract field description by parsing the class source code."""
+        try:
+            import inspect
+            source = inspect.getsource(cls)
+            # Parse the source to find Field definitions
+            tree = ast.parse(source)
+            
+            for node in ast.walk(tree):
+                if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    if node.target.id == field_name and node.value:
+                        # Check if the value is a Field() call
+                        if isinstance(node.value, ast.Call):
+                            desc = self._extract_description_from_field_call(node.value)
+                            if desc:
+                                return desc
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == field_name:
+                            if isinstance(node.value, ast.Call):
+                                desc = self._extract_description_from_field_call(node.value)
+                                if desc:
+                                    return desc
+        except Exception as e:
+            Log.warning(f"Failed to parse source for {cls.__name__}.{field_name}: {e}")
+            
+        return None
+    
+    def _extract_description_from_field_call(self, call_node: ast.Call) -> Optional[str]:
+        """Extract description from a Field() call in AST."""
+        try:
+            # Check if this is a Field call
+            if isinstance(call_node.func, ast.Name) and call_node.func.id == 'Field':
+                # Look for description in keyword arguments
+                for keyword in call_node.keywords:
+                    if keyword.arg == 'description' and isinstance(keyword.value, ast.Constant):
+                        return keyword.value.value
+                        
+            return None
+        except Exception:
+            return None
