@@ -1,6 +1,8 @@
+import importlib
 from typing import List, Optional, Callable, Generic, TypeVar, Any
 from .event import Event
 from ..prompt import Prompt, make_prompt
+from functools import lru_cache
 
 
 # Global state
@@ -12,7 +14,9 @@ T1 = TypeVar('T1')
 def handler(func: Callable) -> Callable[['Procedure[Sigma]', Sigma, Event[Any]], 'str | Procedure[Sigma]']:
     setattr(func, 'is_handler', True)
     for _, v in func.__annotations__.items():
-        if isinstance(v, type) and issubclass(v, Event):
+        if issubclass(v, Event):
+            if hasattr(func, 'event_type'):
+                raise ValueError(f"Handler {func.__name__} already has an event type set: {getattr(func, 'event_type')}.")
             setattr(func, 'event_type', v)
     return func
 
@@ -44,6 +48,18 @@ class Procedure(Generic[Sigma]):
             if callable(method) and hasattr(method, 'is_handler') and getattr(method, 'event_type', None) == event_type:
                 return method
         return None
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.prompt})"
+    
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    @lru_cache()
+    def _is_class_method(self, handler):
+        if hasattr(handler, '__self__'):
+            return handler.__self__ is not None
+        return False
     
     def _handle(self, state: Sigma, event: Event[Any]) -> 'str | Procedure[Sigma]':
         """
@@ -55,7 +71,9 @@ class Procedure(Generic[Sigma]):
         handler = self._get_handler(event.__class__)
         if handler:
             try:
-                return handler(self, state, event)
+                if not self._is_class_method(handler):
+                    return handler(self, state, event)
+                return handler(state, event)
             except Exception as e:
                 return self.recover_prompt(state, event, e)
         else:

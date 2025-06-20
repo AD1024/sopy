@@ -1,6 +1,6 @@
 from . import event, procedure, sop
 from .procedure import Procedure, End, handler, Sigma
-from .event import Event, EventTranslator, show
+from .event import Event, EventBus, EventTranslator, subscribe, show
 from .sop import SOP
 
 __all__ = [
@@ -9,8 +9,10 @@ __all__ = [
     "handler",
     "Sigma",
     "Event",
+    "EventBus",
     "EventTranslator",
     "show",
+    "subscribe",
     "event",
     "procedure",
     "sop",

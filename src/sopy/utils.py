@@ -216,26 +216,26 @@ class Log:
 
     # Convenience functions for quick logging
     @staticmethod
-    def verbose(message: str, include_timestamp: bool = True):
+    def verbose(message: str, include_timestamp: bool = False):
         """Quick verbose logging function"""
         Log.logger.verbose(message, include_timestamp)
 
     @staticmethod
-    def debug(message: str, include_timestamp: bool = True):
+    def debug(message: str, include_timestamp: bool = False):
         """Quick debug logging function"""
         Log.logger.debug(message, include_timestamp)
 
     @staticmethod
-    def info(message: str, include_timestamp: bool = True):
+    def info(message: str, include_timestamp: bool = False):
         """Quick info logging function"""
         Log.logger.info(message, include_timestamp)
 
     @staticmethod
-    def warning(message: str, include_timestamp: bool = True):
+    def warning(message: str, include_timestamp: bool = False):
         """Quick warning logging function"""
         Log.logger.warning(message, include_timestamp)
 
     @staticmethod
-    def error(message: str, include_timestamp: bool = True):
+    def error(message: str, include_timestamp: bool = False):
         """Quick error logging function"""
         Log.logger.error(message, include_timestamp)
