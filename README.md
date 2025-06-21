@@ -163,6 +163,9 @@ This project is licensed under the terms specified in the LICENSE file.
 
 ## 🔗 Related Projects
 
+SOPy takes inpiration from the following projects:
+
+- [P-framework] (https://github.com/p-org/P) - Formal Modeling and Analysis of Distributed (Event-Driven) Systems
 - [Strands](https://github.com/strands-ai/strands) - LLM agent framework with tool integration
 - [LangChain](https://github.com/langchain-ai/langchain) - Framework for developing LLM applications
 
