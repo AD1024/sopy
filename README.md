@@ -148,15 +148,6 @@ Procedure MigrateCopy:
 - 🚧 Advanced monitoring, debugging and tracing tools
 - 🚧 Performance optimizations
 
-## 🤝 Contributing
-
-We welcome contributions! Please see our contributing guidelines and feel free to:
-
-- Report bugs and request features
-- Submit pull requests
-- Improve documentation
-- Share examples and use cases
-
 ## 📄 License
 
 This project is licensed under the terms specified in the LICENSE file.
