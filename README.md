@@ -1,4 +1,4 @@
-# SOPy: Structural Standard Operating Procedure Framework
+# SOPy: Structural Standard Operating Procedure Framework (🚧 UNDER CONSTRUCTION 🚧)
 
 SOPy is a state machine-based framework for monitoring and controlling LLM agent actions with automatic recovery mechanisms. It enables developers to create reliable, structured workflows for AI agents by encoding Standard Operating Procedures (SOPs) as state machines that automatically generate natural language prompts and handle error recovery.
 
