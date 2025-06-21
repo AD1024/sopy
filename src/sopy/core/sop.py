@@ -94,7 +94,7 @@ class SOP(Generic[Sigma]):
         if not self._sop_ctx:
             raise RuntimeError(f"`observe` should not be called outside of SOP context. Use `with` to enter the context.")
         try:
-            Log.info(f"{self.__class__.__name__} Now at " + str(self.current_proc) + f" handling {e}")
+            Log.debug(f"{self.__class__.__name__} Now at " + str(self.current_proc) + f" handling {e}")
             nxt = self.current_proc._handle(self.state, e)
             if isinstance(nxt, str):
                 self.try_recover(make_prompt(nxt))

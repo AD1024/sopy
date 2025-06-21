@@ -2,7 +2,7 @@ from pydantic import Field, BaseModel
 from sopy import Procedure, handler, End, make_prompt, Prompt, SOP
 from sopy.prompt import cond
 from sopy.interface.strands import StrandsAgent
-from sopy.utils import Log
+from sopy.utils import Log, LogLevel
 from sopy.prompt.prompt_generator import make_prompt_from_procedure
 from events import *
 from file_sys_sim import *
@@ -185,12 +185,15 @@ def start_task(src_path: str, dst_path: str, backup_path: str):
         dst_path (str): The destination path to which files are to be migrated.
         backup_path (str): The backup path where files are temporarily stored during migration.
     """
+    Log.set_min_level(LogLevel.DEBUG)
     objective = "Migrate files from source to destination with backup safety"
     sop = FileSystemOperator(src_path, dst_path, backup_path).observes(
         eReadDirectory, eFileDeleteRequest, eFileDeleted, eCopyRequest, eFileCopied
     )
     prompt = make_prompt_from_procedure(sop.init_proc, objective)
+    Log.info("=" * 40 + " Auto-Generated SOP Prompt " + "=" * 40)
     print(prompt)
+    Log.info("=" * 40 + " End of Generated SOP Prompt " + "=" * 40)
     agent = StrandsAgent(tools=[read_dir, cp, delete], system_prompt=prompt)
     sop = sop.with_recovery(
         error_handler=lambda prompt: agent(f"Error occurred: {prompt}"),
@@ -209,6 +212,10 @@ def start_task(src_path: str, dst_path: str, backup_path: str):
     assert migrated_files == current_files, f"Files in destination {dst_path} do not match source {src_path}. Migrated files: {migrated_files}, Source files: {current_files}"
     assert len(backup_files) == 0, f"Backup files {backup_files} should be empty after migration. Some files were not deleted."
     assert read_dir(src_path)[1] == [], f"Source directory {src_path} should be empty after migration. Remaining files: {read_dir(src_path)}"
+    print()
+    Log.info("=" * 100)
+    Log.info(f"Sanity check passed. All files migrated from {src_path} to {dst_path} with backup at {backup_path}.")
+    Log.info("=" * 100)
 
 
 start_task('/files', '/migrated_files', '/backups')
